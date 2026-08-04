@@ -2029,7 +2029,7 @@ namespace IMGUIZMO_NAMESPACE
       if (gContext.mbUsing && (gContext.mActualID == -1 || gContext.mActualID == gContext.mEditingID) && IsTranslateType(gContext.mCurrentOperation))
       {
  #if defined(IMGUI_VERSION_NUM) && IMGUI_VERSION_NUM >= 18700
-         ImGui::SetNextFrameWantCaptureMouse(true);
+         ImGui::CaptureMouseFromApp(true);
  #else
          ImGui::CaptureMouseFromApp();
  #endif
@@ -2104,7 +2104,7 @@ namespace IMGUIZMO_NAMESPACE
          if (type != MT_NONE)
          {
  #if defined(IMGUI_VERSION_NUM) && IMGUI_VERSION_NUM >= 18700
-            ImGui::SetNextFrameWantCaptureMouse(true);
+            ImGui::CaptureMouseFromApp(true);
  #else
             ImGui::CaptureMouseFromApp();
  #endif
@@ -2153,7 +2153,7 @@ namespace IMGUIZMO_NAMESPACE
          if (type != MT_NONE)
          {
  #if defined(IMGUI_VERSION_NUM) && IMGUI_VERSION_NUM >= 18700
-            ImGui::SetNextFrameWantCaptureMouse(true);
+            ImGui::CaptureMouseFromApp(true);
  #else
             ImGui::CaptureMouseFromApp();
  #endif
@@ -2180,7 +2180,7 @@ namespace IMGUIZMO_NAMESPACE
       if (gContext.mbUsing && (gContext.mActualID == -1 || gContext.mActualID == gContext.mEditingID) && IsScaleType(gContext.mCurrentOperation))
       {
  #if defined(IMGUI_VERSION_NUM) && IMGUI_VERSION_NUM >= 18700
-         ImGui::SetNextFrameWantCaptureMouse(true);
+         ImGui::CaptureMouseFromApp(true);
  #else
          ImGui::CaptureMouseFromApp();
  #endif
@@ -2275,7 +2275,7 @@ namespace IMGUIZMO_NAMESPACE
          if (type != MT_NONE)
          {
  #if defined(IMGUI_VERSION_NUM) && IMGUI_VERSION_NUM >= 18700
-            ImGui::SetNextFrameWantCaptureMouse(true);
+            ImGui::CaptureMouseFromApp(true);
  #else
             ImGui::CaptureMouseFromApp();
  #endif
@@ -2313,7 +2313,7 @@ namespace IMGUIZMO_NAMESPACE
       if (gContext.mbUsing && (gContext.mActualID == -1 || gContext.mActualID == gContext.mEditingID) && IsRotateType(gContext.mCurrentOperation))
       {
  #if defined(IMGUI_VERSION_NUM) && IMGUI_VERSION_NUM >= 18700
-         ImGui::SetNextFrameWantCaptureMouse(true);
+         ImGui::CaptureMouseFromApp(true);
  #else
          ImGui::CaptureMouseFromApp();
  #endif

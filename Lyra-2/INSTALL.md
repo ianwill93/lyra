@@ -28,14 +28,23 @@ export CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++"
 
 # 5. Install Python dependencies
 pip install --no-deps -r requirements.txt
-pip install "git+https://github.com/microsoft/MoGe.git"
+# If you have a local MoGe clone, install it editable and add its git-backed extras separately.
+# This avoids re-resolving torch while still installing utils3d and pipeline.
+if [ -d "${PWD}/MoGe" ]; then
+  pip install --no-deps -e "${PWD}/MoGe"
+  pip install --no-deps "git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183"
+  pip install --no-deps "git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6"
+else
+  pip install "git+https://github.com/microsoft/MoGe.git"
+fi
 pip install --no-build-isolation "transformer_engine[pytorch]"
 # Symlink cuda_runtime as cudart for transformer_engine compatibility
 SITE=$CONDA_PREFIX/lib/python3.10/site-packages
 ln -sf "$SITE/nvidia/cuda_runtime" "$SITE/nvidia/cudart"
 
 # 6. Install Flash Attention
-MAX_JOBS=16 pip install --no-build-isolation --no-binary :all: flash-attn==2.6.3
+# Build from source by default with a safer parallelism limit.
+MAX_JOBS=4 pip install --no-build-isolation --no-binary :all: flash-attn==2.6.3
 
 # 7. Build vendored CUDA extensions
 USE_SYSTEM_EIGEN=1 pip install --no-build-isolation -e 'lyra_2/_src/inference/vipe'

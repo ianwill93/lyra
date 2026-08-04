@@ -50,7 +50,9 @@ from lyra_2._src.inference.camera_traj_utils import (
 from lyra_2._src.utils.model_loader import load_model_from_checkpoint
 
 torch.enable_grad(False)
-torch.backends.cudnn.enabled = False
+# Was false before my adjustments, but we want to keep cuDNN enabled for the VAE decode path so the GPU can run the faster kernels instead of stalling on the slower fallback path.
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
 
 # ---------------------------------------------------------------------------
 # DA3 single-image depth (reused from lyra2_ar_inference_from_image)

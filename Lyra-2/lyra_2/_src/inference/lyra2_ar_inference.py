@@ -33,6 +33,9 @@ from lyra_2._src.datasets.forward_warp_utils_pytorch import (
 )
 
 torch.enable_grad(False)
+# Was false before my adjustments, but we want to keep cuDNN enabled for the VAE decode path so the GPU can run the faster kernels instead of stalling on the slower fallback path.
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
 
 def _get_vae_handles(model):
     vae_iface = model.tokenizer
@@ -131,13 +134,10 @@ def _decode_new_latent_chunk(
         _move_vae_decoder(vae_core, vae_device, layerwise=True)
     prior_cudnn_enabled = torch.backends.cudnn.enabled
     prior_cudnn_benchmark = torch.backends.cudnn.benchmark
-    # Lyra/conditioning convolutions can populate the process-wide cuDNN plan
-    # cache with a Conv3D algorithm whose workspace exceeds an 80GB H100 when
-    # reused by the streaming VAE.  Isolate VAE decode on PyTorch's native CUDA
-    # convolution path, matching the released Lyra inference scripts.  Tensor
-    # shapes, weights, dtype, and causal computation remain unchanged.
-    torch.backends.cudnn.enabled = False
-    torch.backends.cudnn.benchmark = False
+    # Keep cuDNN enabled for the decode path so the GPU can run the faster
+    # kernels instead of stalling on the slower fallback path.
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = True
     decode_device = torch.device(vae_device)
     if decode_device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(decode_device)
@@ -168,11 +168,9 @@ def _decode_new_latent_chunk(
                 # Completed pixel slices are not consumed by subsequent decoder slices.
                 outs.append(out_t.cpu() if enable_offload else out_t)
                 del z_t, x_t, out_t
-                if decode_device.type == "cuda":
-                    # A layerwise-offloaded token launches many differently
-                    # shaped convolutions.  Flush their completed workspaces at
-                    # the token boundary so they cannot accumulate across the
-                    # 20-token AR loop.
+                if decode_device.type == "cuda" and (enable_offload or offload_vae):
+                    # Only flush workspaces while we are actively offloading or
+                    # staging the VAE. The resident-GPU path should stay hot.
                     gc.collect()
                     torch.cuda.synchronize(decode_device)
                     with torch.cuda.device(decode_device):
@@ -892,8 +890,9 @@ class Lyra2InferencePipeline:
             )
         finally:
             self.model._collect_return_condition_state = prev_collect
-        gc.collect()
-        torch.cuda.empty_cache()
+        if self.args.offload or vae_offload:
+            gc.collect()
+            torch.cuda.empty_cache()
         warp_pixels = getattr(self.model, "_latest_condition_state_pixels", None)
         if self.use_pose and warp_pixels is not None:
             if isinstance(warp_pixels, torch.Tensor) and warp_pixels.dim() == 5:
@@ -971,20 +970,21 @@ class Lyra2InferencePipeline:
             _offload_diffusion_to_cpu(self.model, True)
         if vae_offload:
             _move_vae_encoder(self.vae_core, "cpu")
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            memory_stats = []
-            for device_idx in range(torch.cuda.device_count()):
-                memory_stats.append(
-                    f"cuda:{device_idx} allocated="
-                    f"{torch.cuda.memory_allocated(device_idx) / (1024 ** 3):.2f} GiB, "
-                    f"reserved={torch.cuda.memory_reserved(device_idx) / (1024 ** 3):.2f} GiB"
+        if self.args.offload or vae_offload:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                memory_stats = []
+                for device_idx in range(torch.cuda.device_count()):
+                    memory_stats.append(
+                        f"cuda:{device_idx} allocated="
+                        f"{torch.cuda.memory_allocated(device_idx) / (1024 ** 3):.2f} GiB, "
+                        f"reserved={torch.cuda.memory_reserved(device_idx) / (1024 ** 3):.2f} GiB"
+                    )
+                log.info(
+                    "AR VAE handoff: " + "; ".join(memory_stats),
+                    rank0_only=True,
                 )
-            log.info(
-                "AR VAE handoff: " + "; ".join(memory_stats),
-                rank0_only=True,
-            )
 
         try:
             new_generated_frames = _decode_new_latent_chunk(
@@ -1059,7 +1059,7 @@ class Lyra2InferencePipeline:
         if self.use_pose and not is_last_step:
             self._update_depth_cache(end_px_idx)
         del gen_chunk, new_generated_frames, gen_chunk_reencoded
-        if torch.cuda.is_available():
+        if (self.args.offload or vae_offload) and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         self.ar_idx += 1

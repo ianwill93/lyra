@@ -553,10 +553,10 @@ PYBIND11_MODULE(pyngp, m) {
 		.def_readwrite("file_drop_callback", &Testbed::m_file_drop_callback)
 		.def("is_key_pressed", [](py::object& obj, int key) { return ImGui::IsKeyPressed((ImGuiKey)key); })
 		.def("is_key_down", [](py::object& obj, int key) { return ImGui::IsKeyDown((ImGuiKey)key); })
-		.def("is_alt_down", [](py::object& obj) { return (ImGui::GetIO().KeyMods & ImGuiMod_Alt) != 0; })
-		.def("is_ctrl_down", [](py::object& obj) { return (ImGui::GetIO().KeyMods & ImGuiMod_Ctrl) != 0; })
-		.def("is_shift_down", [](py::object& obj) { return (ImGui::GetIO().KeyMods & ImGuiMod_Shift) != 0; })
-		.def("is_super_down", [](py::object& obj) { return (ImGui::GetIO().KeyMods & ImGuiMod_Super) != 0; })
+		.def("is_alt_down", [](py::object& obj) { return (ImGui::GetIO().KeyMods & ImGuiKeyModFlags_Alt) != 0; })
+		.def("is_ctrl_down", [](py::object& obj) { return (ImGui::GetIO().KeyMods & ImGuiKeyModFlags_Ctrl) != 0; })
+		.def("is_shift_down", [](py::object& obj) { return (ImGui::GetIO().KeyMods & ImGuiKeyModFlags_Shift) != 0; })
+		.def("is_super_down", [](py::object& obj) { return (ImGui::GetIO().KeyMods & ImGuiKeyModFlags_Super) != 0; })
 		.def(
 			"screenshot",
 			&Testbed::screenshot,

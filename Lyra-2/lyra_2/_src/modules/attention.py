@@ -136,6 +136,16 @@ def attention(
                 SDPBackend.EFFICIENT_ATTENTION,
             ]
             BEST_SDPA_BACKEND = SDPBackend.CUDNN_ATTENTION
+        elif compute_cap >= 100 and is_half:
+            # Blackwell GPUs can be newer than Ampere but may not be supported by
+            # the Flash Attention 2 runtime shipped with flash-attn 2.x. Prefer
+            # cuDNN for stable half-precision attention on pp103+ hardware.
+            SDPA_BACKENDS = [
+                SDPBackend.CUDNN_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.FLASH_ATTENTION,
+            ]
+            BEST_SDPA_BACKEND = SDPBackend.CUDNN_ATTENTION
         elif is_half:
             SDPA_BACKENDS = [
                 SDPBackend.FLASH_ATTENTION,

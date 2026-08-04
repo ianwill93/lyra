@@ -17,27 +17,33 @@
 # from Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 
 import math
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
 import torch.amp as amp
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange, repeat
 
 try:
     from flash_attn.layers.rotary import apply_rotary_emb as flash_apply_rotary_emb
-except ImportError:
+except ImportError:  # pragma: no cover - optional dependency
     flash_apply_rotary_emb = None
-    raise ImportError("flash_attn is not installed.")
 
 from torch.distributed import ProcessGroup, get_process_group_ranks
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as ptd_checkpoint_wrapper
 from torchvision import transforms
-from transformer_engine.pytorch.attention import DotProductAttention
+
+try:
+    from transformer_engine.pytorch.attention import DotProductAttention as _TE_DotProductAttention
+except ImportError:  # pragma: no cover - optional dependency
+    _TE_DotProductAttention = None
 
 from lyra_2._ext.imaginaire.utils import log
 from lyra_2._src.callbacks.model_weights_stats import WeightTrainingStat
+from lyra_2._src.modules.attention import attention as generic_attention
 from lyra_2._src.modules.selective_activation_checkpoint import (
     CheckpointMode,
 )
@@ -202,16 +208,9 @@ def sinusoidal_embedding_1d(dim, position):
 
 def rope_apply(x, video_size: VideoSize, freqs):
     """
-    Optimized version of rope_apply using flash_attention's rotary embedding implementation.
-    This version processes the entire batch at once for efficiency.
-
-    Args:
-        x (Tensor): Input tensor with shape [batch_size, seq_len, n_heads, head_dim]
-        video_size (VideoSize): Video dimensions with shape [T, H, W]
-        freqs (Tensor): Complex frequencies with shape [max_seq_len, head_dim // 2]
-
-    Returns:
-        Tensor: Rotary-embedded tensor with same shape as input
+    Apply rotary positional embeddings. Prefer flash-attn when available, but fall back to a
+    pure PyTorch implementation for compatibility with environments where flash-attn is absent
+    or incompatible with the installed GPU/driver stack.
     """
     batch_size, seq_len, n_heads, head_dim = x.shape
 
@@ -226,9 +225,16 @@ def rope_apply(x, video_size: VideoSize, freqs):
     cos = torch.cos(freqs).to(torch.float32)
     sin = torch.sin(freqs).to(torch.float32)
 
-    # Apply the rotation
-    rotated = flash_apply_rotary_emb(x.to(torch.float32), cos, sin, interleaved=True, inplace=False)
+    if flash_apply_rotary_emb is not None:
+        rotated = flash_apply_rotary_emb(x.to(torch.float32), cos, sin, interleaved=True, inplace=False)
+        return rotated.to(x.dtype)
 
+    x_fp32 = x.to(torch.float32)
+    x_even = x_fp32[..., 0::2]
+    x_odd = x_fp32[..., 1::2]
+    rotated_even = x_even * cos - x_odd * sin
+    rotated_odd = x_even * sin + x_odd * cos
+    rotated = torch.stack((rotated_even, rotated_odd), dim=-1).reshape_as(x_fp32)
     return rotated.to(x.dtype)
 
 
@@ -266,7 +272,124 @@ class WanLayerNorm(nn.LayerNorm):
         return super().forward(x)
 
 
-class SelfAttnOp(DotProductAttention):
+def _resolve_attention_compute_dtype(q, k=None, v=None):
+    if q.device.type != "cuda":
+        return q.dtype
+
+    if q.dtype in (torch.float64, torch.float32):
+        return torch.bfloat16
+    return q.dtype
+
+
+def _chunked_scaled_dot_product_attention(q, k, v, *, scale, chunk_size=64):
+    """Memory-efficient attention that processes queries and keys in small chunks."""
+    b, h, l, d = q.shape
+    out = torch.empty_like(q)
+
+    for q_start in range(0, l, chunk_size):
+        q_end = min(q_start + chunk_size, l)
+        q_chunk = q[:, :, q_start:q_end, :].float()
+        acc = torch.zeros((b, h, q_end - q_start, d), device=q.device, dtype=torch.float32)
+
+        for k_start in range(0, l, chunk_size):
+            k_end = min(k_start + chunk_size, l)
+            k_chunk = k[:, :, k_start:k_end, :].float()
+            v_chunk = v[:, :, k_start:k_end, :].float()
+
+            scores = torch.matmul(q_chunk, k_chunk.transpose(-1, -2)) * scale
+            attn = torch.softmax(scores, dim=-1)
+            acc += torch.matmul(attn, v_chunk)
+
+        out[:, :, q_start:q_end, :] = acc.to(dtype=q.dtype)
+
+    return out
+
+
+class SafeDotProductAttention(nn.Module):
+    def __init__(self, num_heads, head_dim, num_gqa_groups=None, attention_dropout=0.0, qkv_format="bshd", attn_mask_type="no_mask"):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.num_gqa_groups = num_gqa_groups
+        self.attention_dropout = attention_dropout
+        self.qkv_format = qkv_format
+        self.attn_mask_type = attn_mask_type
+        self._te_attention = None
+
+        if _TE_DotProductAttention is not None:
+            device = torch.device("cuda") if torch.cuda.is_available() else None
+            if device is not None and torch.version.cuda:
+                try:
+                    major, minor = torch.cuda.get_device_capability(device)
+                    if 80 <= major * 10 + minor < 100:
+                        self._te_attention = _TE_DotProductAttention(
+                            num_heads,
+                            head_dim,
+                            num_gqa_groups=num_gqa_groups,
+                            attention_dropout=attention_dropout,
+                            qkv_format=qkv_format,
+                            attn_mask_type=attn_mask_type,
+                        )
+                except Exception:  # pragma: no cover - runtime GPU capability lookup
+                    self._te_attention = None
+
+    def forward(self, q_B_L_H_D, k_B_L_H_D, v_B_L_H_D, *args, **kwargs):
+        if self._te_attention is not None:
+            try:
+                return self._te_attention(q_B_L_H_D, k_B_L_H_D, v_B_L_H_D, *args, **kwargs)
+            except RuntimeError as exc:
+                msg = str(exc)
+                if "FlashAttention only supports Ampere GPUs or newer" not in msg and "requires Ampere" not in msg:
+                    raise
+
+        try:
+            return generic_attention(
+                q_B_L_H_D,
+                k_B_L_H_D,
+                v_B_L_H_D,
+                dropout_p=self.attention_dropout,
+                softmax_scale=1.0 / math.sqrt(self.head_dim),
+                causal=False,
+                dtype=q_B_L_H_D.dtype,
+            )
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+
+            compute_dtype = _resolve_attention_compute_dtype(q_B_L_H_D, k_B_L_H_D, v_B_L_H_D)
+            q = q_B_L_H_D.transpose(1, 2)
+            k = k_B_L_H_D.transpose(1, 2)
+            v = v_B_L_H_D.transpose(1, 2)
+
+            if compute_dtype != q_B_L_H_D.dtype:
+                q = q.to(compute_dtype)
+                k = k.to(compute_dtype)
+                v = v.to(compute_dtype)
+
+            autocast_dtype = compute_dtype if compute_dtype in (torch.float16, torch.bfloat16) else None
+            autocast_context = (
+                torch.autocast(device_type="cuda", dtype=autocast_dtype)
+                if q_B_L_H_D.is_cuda and autocast_dtype is not None
+                else nullcontext()
+            )
+
+            with autocast_context:
+                out = _chunked_scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale=1.0 / math.sqrt(self.head_dim),
+                    chunk_size=64,
+                )
+
+            return out.transpose(1, 2).contiguous().to(q_B_L_H_D.dtype)
+
+    def set_context_parallel_group(self, process_group, ranks, stream, cp_comm_type="p2p"):
+        if self._te_attention is not None:
+            self._te_attention.set_context_parallel_group(process_group, ranks, stream, cp_comm_type=cp_comm_type)
+
+
+class SelfAttnOp(SafeDotProductAttention):
     def forward(
         self,
         q_B_L_H_D,
@@ -386,7 +509,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.v_img = nn.Linear(dim, dim)
         # self.alpha = nn.Parameter(torch.zeros((1, )))
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.attn_op_image = DotProductAttention(
+        self.attn_op_image = SafeDotProductAttention(
             self.num_heads,
             self.head_dim,
             num_gqa_groups=self.num_heads,
