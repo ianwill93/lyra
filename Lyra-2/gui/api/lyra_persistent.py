@@ -44,6 +44,24 @@ def _env_bool(name: str, default: bool = False) -> bool:
 	return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _int4_net_resident() -> bool:
+	"""True when the quantized DiT must stay on the GPU (PLAN-LYRA2-INT4 fix A).
+
+	torchao 0.11's int4 TensorCoreTiled impl cannot be moved with .to(), so
+	_video_net_on_cpu skips the net offload entirely at level int4 and the
+	~10-12 GB quantized net stays resident. Read per call, not at import:
+	POST /models/activate re-writes LYRA_GUI_QUANTIZE at runtime. The
+	quantize_utils import is guarded because that module only ships in the
+	container image; the bare repo tree falls back to the same env contract.
+	"""
+	try:
+		from quantize_utils import quantize_level
+
+		return quantize_level() == "int4"
+	except ImportError:
+		return os.environ.get("LYRA_GUI_QUANTIZE", "none").strip().lower() == "int4"
+
+
 def _safe_name(value: str) -> str:
 	return "".join(c if c.isalnum() or c in "-_" else "_" for c in value).strip("_") or "session"
 
@@ -215,7 +233,11 @@ class Lyra2PersistentModel:
 				da3_device = next(self.da3_model.parameters()).device
 			except StopIteration:
 				da3_device = torch.device("cpu")
-		self.video_model.net.to("cpu")
+		# int4 residency (PLAN-LYRA2-INT4 fix A): the quantized net cannot move
+		# cuda->cpu (TensorCoreTiledAQTTensorImpl.to raises), so skip the offload.
+		resident_net = _int4_net_resident()
+		if not resident_net:
+			self.video_model.net.to("cpu")
 		for clip_module, _ in clip_modules:
 			clip_module.to("cpu")
 		if also_da3:
@@ -228,7 +250,9 @@ class Lyra2PersistentModel:
 		finally:
 			if also_da3 and da3_device is not None:
 				self.da3_model.to(da3_device)
-			self.video_model.net.to(device=self.device, dtype=self.dtype)
+			# The dtype cast is a device conversion too: skip it for the resident net.
+			if not resident_net:
+				self.video_model.net.to(device=self.device, dtype=self.dtype)
 			for clip_module, original_device in clip_modules:
 				clip_module.to(original_device)
 			if torch.cuda.is_available():
@@ -424,6 +448,12 @@ class Lyra2PersistentModel:
 		image_u8, image_chw01 = self._resize_seed(images_np)
 
 		if depths_np is None:
+			# Restore DA3 to the model device before running it: the end of the
+			# previous seed (and each post-generation cache update) offloads it to
+			# CPU, and the video-net offload below does not touch it. DA3 on CPU
+			# dies in DINOv2's fp32 patch-embed conv under bf16 autocast ("Input
+			# type (c10::BFloat16) and bias type (float) should be the same").
+			self.da3_model.to(self.device)
 			with self._video_net_on_cpu(also_da3=False):
 				image_chw01, depth_hw, K_33, mask_hw = _da3_infer_depth_intrinsics_single(
 					self.da3_model,

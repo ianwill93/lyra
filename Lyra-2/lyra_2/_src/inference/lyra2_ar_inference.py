@@ -51,6 +51,23 @@ def _move_vae_cache(cache, device):
     return [value.to(device) if isinstance(value, torch.Tensor) else value for value in cache]
 
 
+def _int4_net_resident() -> bool:
+    """True when the quantize level is int4, so the DiT must stay on the GPU.
+
+    PLAN-LYRA2-INT4 fix A: torchao 0.11's int4 TensorCoreTiled impl raises
+    on .to() device moves, so the offload/restore pair below no-ops at level
+    int4 and the ~10-12 GB quantized net stays resident. Read per call: the
+    env contract is owned by gui/api/quantize_utils.py, which only ships in
+    the container image; the bare repo tree falls back to the same variable.
+    """
+    try:
+        from quantize_utils import quantize_level
+
+        return quantize_level() == "int4"
+    except ImportError:
+        return os.environ.get("LYRA_GUI_QUANTIZE", "none").strip().lower() == "int4"
+
+
 def _move_vae_encoder(vae_core, device):
     """Move the streaming VAE encoder and its latent projection together."""
     vae_core.encoder.to(device)
@@ -311,6 +328,7 @@ def _predict_da3_depth_window(
     images: List[np.ndarray] = []
     exts: List[np.ndarray] = []
     ixts: List[np.ndarray] = []
+    nonfinite_frames: List[int] = []
 
     hist_cpu = history_frames[0].detach().cpu()  # [C,T,H,W]
     cam_cpu = cam_w2c.detach().cpu()
@@ -323,9 +341,25 @@ def _predict_da3_depth_window(
         frame_chw = hist_cpu[:, t]  # [C,H,W] in [-1,1]
         frame_0_1 = (frame_chw * 0.5 + 0.5).clamp(0.0, 1.0)
         frame_hwc = frame_0_1.permute(1, 2, 0).float().numpy()
+        # A diverged diffusion chunk leaves NaN/Inf in history_frames. clamp()
+        # propagates NaN, so the uint8 cast below warns ("invalid value
+        # encountered in cast") and hands DA3 an arbitrary frame; DA3 then
+        # answers with a singular pose. Zero it and report it instead.
+        if not np.isfinite(frame_hwc).all():
+            nonfinite_frames.append(int(f))
+            frame_hwc = np.nan_to_num(frame_hwc, nan=0.0, posinf=1.0, neginf=0.0)
         images.append(np.clip(frame_hwc * 255.0 + 0.5, 0, 255).astype(np.uint8))
         exts.append(cam_cpu[0, f].numpy().astype(np.float32))
         ixts.append(intr_cpu[0, f].numpy().astype(np.float32))
+
+    if nonfinite_frames:
+        log.warning(
+            f"[DA3] {len(nonfinite_frames)} of {len(selected_frames)} window frame(s) "
+            f"had non-finite pixels and were zeroed before depth prediction: "
+            f"{nonfinite_frames[:8]}{'...' if len(nonfinite_frames) > 8 else ''}. "
+            "The generated chunk diverged; expect a degraded spatial cache.",
+            rank0_only=True,
+        )
 
     if not images:
         return {"frame_indices": [], "prediction": None}
@@ -365,6 +399,23 @@ def _predict_da3_depth_window(
 
 
 
+def _poses_are_invertible(w2c_all: torch.Tensor, *, eps: float = 1e-6) -> bool:
+    """True when every matrix in a batch of world-to-camera poses can be inverted.
+
+    DA3's raw predicted poses are a network output. On a degenerate or corrupted
+    window it can return a rotation with a zero column, and `torch.linalg.inv`
+    then raises "The diagonal element N is zero ... input matrix is singular".
+    Callers use False to fall back to the pipeline poses -- a quality loss
+    rather than a failed generation.
+    """
+    if w2c_all.dim() != 3 or w2c_all.shape[-2:] != (4, 4):
+        return False
+    if not torch.isfinite(w2c_all).all():
+        return False
+    dets = torch.linalg.det(w2c_all[:, :3, :3]).abs()
+    return bool((dets > eps).all().item()) and bool((dets < 1.0 / eps).all().item())
+
+
 def _camera_centers_from_w2c(w2c: torch.Tensor) -> torch.Tensor:
     """Compute camera centers from world-to-camera matrices."""
     R = w2c[:, :3, :3]
@@ -390,6 +441,10 @@ def _intrinsics_vec_to_k33(intrinsics_vec: torch.Tensor) -> torch.Tensor:
 def _offload_diffusion_to_cpu(model, enable_offload: bool):
     """Move diffusion model to CPU if offload is enabled."""
     if enable_offload and hasattr(model, 'net'):
+        # int4 residency (PLAN-LYRA2-INT4 fix A): TensorCoreTiledAQTTensorImpl
+        # raises on cuda->cpu, so the quantized net simply stays resident.
+        if _int4_net_resident():
+            return
         model.net.cpu()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -398,6 +453,8 @@ def _offload_diffusion_to_cpu(model, enable_offload: bool):
 def _restore_diffusion_to_gpu(model, enable_offload: bool):
     """Move diffusion model back to GPU if offload is enabled."""
     if enable_offload and hasattr(model, 'net'):
+        if _int4_net_resident():  # the int4 net never left the GPU (fix A)
+            return
         model.net.to(model.tensor_kwargs.get("device", "cuda"))
 
 
@@ -1053,6 +1110,21 @@ class Lyra2InferencePipeline:
                 [self.history_latents, gen_chunk_reencoded.to(self.history_latents.dtype)],
                 dim=2,
             )
+        if not torch.isfinite(new_generated_frames).all():
+            # Surfacing this here is the difference between "your camera path
+            # left the model's supported range" and a singular-matrix crash
+            # during the cache update minutes later.
+            bad_mask = ~torch.isfinite(new_generated_frames)
+            bad_frames = bad_mask.any(dim=(0, 3, 4)).any(dim=0).nonzero().flatten().tolist()
+            log.warning(
+                f"[NaN] AR step {self.ar_idx} generated non-finite pixels in "
+                f"{len(bad_frames)} frame(s) {bad_frames[:8]}"
+                f"{'...' if len(bad_frames) > 8 else ''}. The authored cameras are "
+                "probably too far from the seeded world or too close together; "
+                "the run continues, but this chunk is not usable as a preview.",
+                rank0_only=True,
+            )
+
         self.last_hist_frame = new_generated_frames[:, :, -1]
         self.tokens_generated += self.model.framepack_num_new_latent_frames
 
@@ -1133,6 +1205,15 @@ class Lyra2InferencePipeline:
                         pad[:, 3, 3] = 1.0
                         pred_w2c_all = pad
 
+                    poses_usable = _poses_are_invertible(pred_w2c_all)
+                    if not poses_usable:
+                        log.warning(
+                            "[da3_use_predicted_pose] DA3 returned poses that cannot be "
+                            "inverted (singular or non-finite); keeping the pipeline "
+                            "poses for this chunk instead of aligning to them.",
+                            rank0_only=True,
+                        )
+
                     step_size = int(self.model.framepack_num_new_video_frames)
                     new_frame_start = end_px_idx - step_size
                     hist_local = [i for i, f in enumerate(da3_frames) if f < new_frame_start]
@@ -1140,7 +1221,7 @@ class Lyra2InferencePipeline:
 
                     is_first_segment = (len(hist_local) == 1 and da3_frames[hist_local[0]] == 0)
 
-                    if is_first_segment:
+                    if poses_usable and is_first_segment:
                         # Case a): history = frame 0 only.
                         # Normalise by inv(pred[0]) so frame 0 becomes identity,
                         # then scale the w2c translations by a trajectory-length
@@ -1194,7 +1275,7 @@ class Lyra2InferencePipeline:
                                 f"residual={residual:.6f}",
                                 rank0_only=True,
                             )
-                    elif bool(getattr(self.args, "da3_predicted_pose_continuation", False)):
+                    elif poses_usable and bool(getattr(self.args, "da3_predicted_pose_continuation", False)):
                         assert len(hist_local) >= 2, "Expected at least one history frame for continuation segment."
                         # Case b): continuation segment. Traj-length scale,
                         # normalise at history-last, then anchor to pipeline pose.

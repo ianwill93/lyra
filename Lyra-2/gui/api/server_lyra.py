@@ -76,8 +76,12 @@ class LyraModel(InferenceModel):
 		raise NotImplementedError
 
 	async def seed_model(self, req: SeedingRequest) -> SeedingResult:
+		# Seeding is one long synchronous GPU pass (DA3 depth + first world-model
+		# forward + VAE). Run it in a worker thread so /healthz and the web UI
+		# keep answering while it runs.
 		async with self.inference_lock:
-			result = self.model.seed_model_from_values(
+			result = await asyncio.to_thread(
+				self.model.seed_model_from_values,
 				images_np=req.images,
 				depths_np=req.depths,
 				masks_np=req.masks,
@@ -105,7 +109,10 @@ class LyraModel(InferenceModel):
 			self.pose_history_w2c.append(w2c.copy())
 			self.intrinsics_history.append(intrinsics.copy())
 			try:
-				model_result = self.model.inference_on_cameras(
+				# ~14 s/frame of synchronous GPU work; keep it off the event loop so
+				# /healthz and /inference-result keep answering mid-chunk.
+				model_result = await asyncio.to_thread(
+					self.model.inference_on_cameras,
 					w2c,
 					intrinsics,
 					fps=req.framerate,
@@ -179,7 +186,7 @@ class LyraModel(InferenceModel):
 
 	async def revert_last_generation(self) -> dict:
 		async with self.inference_lock:
-			result = self.model.revert_last_generation()
+			result = await asyncio.to_thread(self.model.revert_last_generation)
 			if result.get("success"):
 				if self.pose_history_w2c:
 					self.pose_history_w2c.pop()
